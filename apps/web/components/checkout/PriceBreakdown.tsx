@@ -70,11 +70,40 @@ export function PriceBreakdown({ listingId, detail }: { listingId: string; detai
 
   async function handleReserve() {
     setLoading(true);
-    // redirige a login/onboarding si no hay sesión, o al flujo de checkout confirmado
-    setTimeout(() => {
-      router.push(`/checkout?listingId=${listingId}&method=${method}`);
+    try {
+      // Obtener guestId del localStorage o sesión (ajustar según tu lógica de auth)
+      const guestId = localStorage.getItem('guestId') || 'guest-' + Math.random().toString(36).substr(2, 9);
+      
+      // Llamar al API route de checkout
+      const response = await fetch('/api/payments/checkout', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          listingId,
+          method,
+          guestId,
+        }),
+      });
+
+      const data = await response.json();
+
+      if (!response.ok) {
+        throw new Error(data.error || 'Error al iniciar el pago');
+      }
+
+      // Redirigir al gateway de pago (Wompi/PlaceToPay)
+      if (data.redirectUrl) {
+        window.location.href = data.redirectUrl;
+      } else {
+        throw new Error('No se recibió URL de redirección');
+      }
+    } catch (error) {
+      console.error('Error en reserva:', error);
+      alert(error instanceof Error ? error.message : 'Error al procesar el pago. Intente nuevamente.');
       setLoading(false);
-    }, 300);
+    }
   }
 
   return (
