@@ -1,0 +1,551 @@
+// ============================================================
+// DIVIDELO - Esquema Prisma (PostgreSQL)
+// Pieza crítica: Ledger de doble entrada INMUTABLE (solo INSERTS)
+// ============================================================
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ============================================================
+// CATÁLOGO DE SERVICIOS DE SUSCRIPCIÓN
+// ============================================================
+
+enum SubscriptionCategory {
+  STREAMING_VIDEO
+  STREAMING_MUSIC
+  GAMING
+  PRODUCTIVITY
+  SOFTWARE
+  EDUCATION
+  FITNESS
+  NEWS
+  OTHER
+}
+
+model SubscriptionService {
+  id                 String               @id @default(cuid())
+  name               String               @unique
+  slug               String               @unique
+  category           SubscriptionCategory
+  logoUrl            String?
+  description        String?
+  basePlans          Json // [{name: "Premium", totalSlots: 4, officialPriceCOP: 54900}, ...]
+  allowSharing       Boolean              @default(true)
+  sharingNotes       String?
+  maxMarkupPercent   Int                  @default(10) // markup máximo permitido al anfitrión
+  platformFeePercent Decimal              @default(9)    // 9% fee por categoría (mejora prioridad alta)
+  createdAt          DateTime             @default(now())
+  updatedAt          DateTime             @updatedAt
+
+  listings Listing[]
+}
+
+// ============================================================
+// USUARIOS, KYC Y REPUTACIÓN
+// ============================================================
+
+enum UserRole {
+  GUEST       // visitante sin registro (solo browsing)
+  USER        // usuario registrado (puede ser anfitrión y/o huésped)
+  MODERATOR
+  ADMIN
+}
+
+enum UserStatus {
+  ACTIVE
+  SUSPENDED
+  BANNED
+  PENDING_VERIFICATION
+}
+
+enum KycStatus {
+  NOT_STARTED
+  PENDING
+  VERIFIED
+  FAILED
+  EXPIRED
+}
+
+model User {
+  id                      String               @id @default(cuid())
+  role                    UserRole             @default(USER)
+  status                  UserStatus           @default(PENDING_VERIFICATION)
+  name                    String?
+  email                   String?              @unique
+  emailVerified           Boolean              @default(false)
+  phone                   String?              @unique
+  phoneVerified           Boolean              @default(false)
+  passwordHash            String?
+  avatarUrl               String?
+  country                 String               @default("CO")
+  language                String               @default("es")
+  // Reputación (señales agregadas)
+  reputationScore         Int                  @default(50) // 0-100
+  totalTransactions       Int                  @default(0)
+  successfulTransactions  Int                  @default(0)
+  disputesLost            Int                  @default(0)
+  onboardingCompleted     Boolean              @default(false)
+  // Preferencias
+  notifyByEmail           Boolean              @default(true)
+  notifyByPush            Boolean              @default(true)
+  notifyBySms             Boolean              @default(false)
+  // Timestamps
+  lastLoginAt             DateTime?
+  createdAt               DateTime             @default(now())
+  updatedAt               DateTime             @updatedAt
+  deletedAt               DateTime?
+
+  kyc                    KycVerification?
+  wallet                 Wallet?
+  hostedListings         Listing[]             @relation("HostListings")
+  membershipsAsGuest     Membership[]          @relation("GuestMemberships")
+  paymentsAsGuest        Payment[]             @relation("GuestPayments")
+  payouts                Payout[]
+  refunds                Refund[]              @relation("UserRefunds")
+  ratingsGiven           Rating[]              @relation("RatingsFrom")
+  ratingsReceived        Rating[]              @relation("RatingsTo")
+  messagesSent           Message[]             @relation("MessagesFrom")
+  disputesInitiated      Dispute[]             @relation("DisputesBy")
+  disputesAgainst        Dispute[]             @relation("DisputesAgainst")
+}
+
+model KycVerification {
+  id              String     @id @default(cuid())
+  userId          String     @unique
+  user            User       @relation(fields: [userId], references: [id], onDelete: Cascade)
+  status          KycStatus  @default(NOT_STARTED)
+  level           Int        @default(1) // 1: telef+email, 2: doc+selfie, 3: listas AML
+  documentType    String?    // CC, CE, TI, PASSPORT
+  documentNumber  String?
+  documentUrl     String?
+  selfieUrl       String?
+  provider        String?    // verifik, truora, onfido
+  providerRef     String?    // id de verificación del proveedor
+  metadata        Json?
+  verifiedAt      DateTime?
+  expiresAt       DateTime?
+  createdAt       DateTime   @default(now())
+  updatedAt       DateTime   @updatedAt
+}
+
+// ============================================================
+// WALLET POR USUARIO (3 bolsillos: available / pending / locked)
+// ============================================================
+
+model Wallet {
+  id             String    @id @default(cuid())
+  userId         String    @unique
+  user           User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  availableCOP   Decimal   @default(0) @db.Decimal(16, 2)
+  pendingCOP     Decimal   @default(0) @db.Decimal(16, 2)
+  lockedCOP      Decimal   @default(0) @db.Decimal(16, 2)
+  currency       String    @default("COP")
+  lastUpdatedAt  DateTime  @updatedAt
+  createdAt      DateTime  @default(now())
+
+  @@index([userId])
+}
+
+// ============================================================
+// MARKETPLACE: PUBLICACIONES (LISTINGS) Y MEMBRESÍAS
+// ============================================================
+
+enum ListingStatus {
+  DRAFT
+  ACTIVE
+  PAUSED
+  CLOSED
+  REMOVED
+}
+
+model Listing {
+  id                      String               @id @default(cuid())
+  hostId                  String
+  host                    User                 @relation("HostListings", fields: [hostId], references: [id])
+  subscriptionServiceId   String
+  subscriptionService     SubscriptionService  @relation(fields: [subscriptionServiceId], references: [id])
+  planName                String               // Ej: "Premium 4 pantallas"
+  totalSlots              Int                  // Cupos totales (incluye anfitrión)
+  availableSlots          Int                  // Cupos disponibles para huéspedes
+  baseSlotPriceCOP        Decimal              @db.Decimal(16, 2) // Cuota base sin markup ni fees
+  markupPercent           Int                  @default(0) // 0 a 10% (según servicio)
+  status                  ListingStatus        @default(ACTIVE)
+  // Términos del anfitrión
+  customInstructions      String?              // Cómo compartir credenciales
+  autoAccept              Boolean              @default(true)
+  payoutInstantEligible   Boolean              @default(false) // según reputación
+  // Metadatos
+  featuredUntil           DateTime?
+  viewCount               Int                  @default(0)
+  createdAt               DateTime             @default(now())
+  updatedAt               DateTime             @updatedAt
+  closedAt                DateTime?
+
+  memberships             Membership[]
+  payments                Payment[]            @relation("ListingPayments")
+  ratings                 Rating[]             @relation("ListingRatings")
+
+  @@index([hostId, status])
+  @@index([subscriptionServiceId, status])
+}
+
+enum MembershipStatus {
+  PENDING_CONFIRMATION
+  ACTIVE
+  CANCELLED
+  EXPIRED
+  REMOVED_BY_HOST
+  REMOVED_BY_PLATFORM
+}
+
+model Membership {
+  id               String             @id @default(cuid())
+  listingId        String
+  listing          Listing            @relation(fields: [listingId], references: [id], onDelete: Cascade)
+  guestId          String
+  guest            User               @relation("GuestMemberships", fields: [guestId], references: [id])
+  slotNumber       Int                // número de cupo (1..N)
+  status           MembershipStatus   @default(PENDING_CONFIRMATION)
+  startDate        DateTime
+  endDate          DateTime?          // si es finito, por defecto indefinido
+  nextBillingDate  DateTime?
+  // Precio pactado al momento de unirse (inmutable por membresía)
+  agreedSlotPriceCOP   Decimal         @db.Decimal(16, 2)
+  agreedMarkupPercent  Int             @default(0)
+  createdAt        DateTime           @default(now())
+  updatedAt        DateTime           @updatedAt
+  cancelledAt      DateTime?
+
+  payments         Payment[]          @relation("MembershipPayments")
+  disputes         Dispute[]
+  messages         Message[]
+
+  @@unique([listingId, slotNumber])
+  @@index([guestId, status])
+  @@index([listingId, status])
+}
+
+// ============================================================
+// PAGOS, ESCROW Y Payouts
+// ============================================================
+
+enum PaymentMethod {
+  NEQUI
+  DAVIPLATA
+  PSE
+  CREDIT_CARD
+  DEBIT_CARD
+  BANK_TRANSFER
+  WALLET_BALANCE
+  ADDI_BNPL
+  RAPPI_PAY
+  EFECTY
+}
+
+enum PaymentStatus {
+  INITIATED
+  PENDING
+  PAID_PENDING_CONFIRMATION  // pago aprobado pero escrow retenido
+  ESCROW_RELEASED            // escrow liberado a anfitrión
+  PARTIALLY_REFUNDED
+  FULLY_REFUNDED
+  FAILED
+  EXPIRED
+  CHARGEBACK
+}
+
+model Payment {
+  id                      String               @id @default(cuid())
+  guestId                 String
+  guest                   User                 @relation("GuestPayments", fields: [guestId], references: [id])
+  listingId               String
+  listing                 Listing              @relation("ListingPayments", fields: [listingId], references: [id])
+  membershipId            String?
+  membership              Membership?          @relation("MembershipPayments", fields: [membershipId], references: [id])
+  // ---- Desglose financiero inmutable ----
+  baseSlotPriceCOP        Decimal              @db.Decimal(16, 2)
+  markupCOP               Decimal              @default(0) @db.Decimal(16, 2)
+  platformFeePercent      Decimal              @db.Decimal(5, 2) // 9% por defecto
+  platformFeeCOP          Decimal              @db.Decimal(16, 2)
+  fixedFeeCOP             Decimal              @db.Decimal(16, 2) // $1.200 COP (mejora prioridad alta)
+  gatewayFeeCOP           Decimal              @default(0) @db.Decimal(16, 2) // costo pasarela estimado
+  protectionFeeCOP        Decimal              @default(0) @db.Decimal(16, 2) // incluido en take rate
+  totalGuestPriceCOP      Decimal              @db.Decimal(16, 2) // lo que paga el huésped
+  hostPayoutCOP           Decimal              @db.Decimal(16, 2) // lo que recibe el anfitrión
+  // ---- Método y pasarela ----
+  method                  PaymentMethod
+  gateway                 String               // wompi, placetopay, mercadopago
+  gatewayPaymentRef       String?              // ID de transacción en pasarela
+  gatewayMetadata         Json?
+  webhookSecretUsed       String?
+  // ---- Estados y tiempos ----
+  status                  PaymentStatus        @default(INITIATED)
+  initiatedAt             DateTime?
+  paidAt                  DateTime?
+  escrowReleasedAt        DateTime?
+  expirationAt            DateTime?
+  failReason              String?
+  // ---- Periodo que cubre ----
+  periodStart             DateTime
+  periodEnd               DateTime
+  isRecurring             Boolean              @default(true)
+  renewalOfPaymentId      String?
+  // Auditoría
+  ipAddress               String?
+  deviceFingerprint       String?
+  riskScore               Int?
+  createdAt               DateTime             @default(now())
+  updatedAt               DateTime             @updatedAt
+
+  ledgerEntries           LedgerEntry[]
+  refunds                 Refund[]             @relation("PaymentRefunds")
+  disputes               Dispute[]
+
+  @@index([guestId, createdAt])
+  @@index([listingId, status])
+  @@index([gateway, gatewayPaymentRef])
+}
+
+// ============================================================
+// LEDGER DE DOBLE ENTRADA - ¡¡INMUTABLE!!
+// Reglas: NUNCA hacer UPDATE ni DELETE.
+// Cada transacción financiera genera 2 registros (débito/crédito).
+// ============================================================
+
+enum LedgerAccountType {
+  USER_WALLET_AVAILABLE
+  USER_WALLET_PENDING
+  USER_WALLET_LOCKED
+  ESCROW_HOLDING
+  PLATFORM_REVENUE
+  PLATFORM_FIXED_FEE
+  PLATFORM_PROTECTION_FEE
+  GATEWAY_PAYABLE
+  PAYABLE_HOST
+  REFUND_PAYABLE
+  CHARGEBACK_LOSS
+  OPERATIONAL_EXPENSE
+}
+
+enum LedgerEntryType {
+  CASH_IN_GATEWAY
+  ESCROW_HOLD
+  ESCROW_RELEASE_TO_HOST
+  ESCROW_RELEASE_FEE_TO_PLATFORM
+  HOST_PAYOUT
+  HOST_PAYOUT_FEE
+  GUEST_REFUND_PARTIAL
+  GUEST_REFUND_FULL
+  CHARGEBACK_DEBIT
+  WALLET_DEPOSIT
+  WALLET_WITHDRAW
+  WALLET_TRANSFER
+  MANUAL_ADJUSTMENT
+  SUBSCRIPTION_FEE
+}
+
+model LedgerEntry {
+  id                 String             @id @default(cuid())
+  transactionId      String?            // correlaciona entradas de una misma operación
+  paymentId          String?
+  payment            Payment?           @relation(fields: [paymentId], references: [id])
+  payoutId           String?
+  payout             Payout?            @relation(fields: [payoutId], references: [id])
+  refundId           String?
+  refund             Refund?            @relation(fields: [refundId], references: [id])
+  // ----- Cuenta -----
+  accountType        LedgerAccountType
+  accountOwnerId     String?            // user_id o "platform"
+  // ----- Doble partida -----
+  debitAmountCOP     Decimal            @default(0) @db.Decimal(16, 2) // siempre >= 0
+  creditAmountCOP    Decimal            @default(0) @db.Decimal(16, 2) // siempre >= 0
+  currency           String             @default("COP")
+  // ----- Tipo -----
+  entryType          LedgerEntryType
+  // ----- Auditoría -----
+  description        String?
+  metadata           Json?
+  createdByUserId    String?
+  isReversal         Boolean            @default(false)
+  reversalOfEntryId  String?
+  isDeleted          Boolean            @default(false)  // SOFT DELETE, ¡nunca físico!
+  deletedReason      String?
+  deletedAt          DateTime?
+  createdAt          DateTime           @default(now())
+
+  @@index([paymentId])
+  @@index([payoutId])
+  @@index([accountType, accountOwnerId, createdAt])
+  @@index([transactionId])
+  // Postgres: aplicar política RLS para prohibir UPDATEs en producción
+}
+
+// ============================================================
+// PAYOUTS A ANFITRIONES
+// ============================================================
+
+enum PayoutStatus {
+  PENDING
+  PROCESSING
+  COMPLETED
+  FAILED
+  CANCELLED
+  REVERSED
+}
+
+model Payout {
+  id               String        @id @default(cuid())
+  userId           String
+  user             User          @relation(fields: [userId], references: [id])
+  amountCOP        Decimal       @db.Decimal(16, 2)
+  feeCOP           Decimal       @default(0) @db.Decimal(16, 2)
+  netAmountCOP     Decimal       @db.Decimal(16, 2)
+  currency         String        @default("COP")
+  method           PaymentMethod
+  destinationRef   String        // teléfono Nequi, número de cuenta, etc.
+  status           PayoutStatus  @default(PENDING)
+  gateway          String
+  gatewayPayoutRef String?
+  gatewayMetadata  Json?
+  // Origen de fondos (IDs de pagos que se liquidan)
+  relatedPaymentIds Json?        // string[] de payment.id
+  expedited        Boolean       @default(false) // 2% fee si es payout acelerado
+  completedAt      DateTime?
+  failedReason     String?
+  createdAt        DateTime      @default(now())
+  updatedAt        DateTime      @updatedAt
+
+  ledgerEntries    LedgerEntry[]
+
+  @@index([userId, status])
+  @@index([status, createdAt])
+}
+
+// ============================================================
+// REEMBOLSOS
+// ============================================================
+
+model Refund {
+  id                String         @id @default(cuid())
+  paymentId         String
+  payment           Payment        @relation("PaymentRefunds", fields: [paymentId], references: [id])
+  requestedById     String
+  requestedBy       User           @relation("UserRefunds", fields: [requestedById], references: [id])
+  amountCOP         Decimal        @db.Decimal(16, 2)
+  currency          String         @default("COP")
+  reason            String
+  isPartial         Boolean
+  gatewayRefundRef  String?
+  status            String         @default("PENDING") // PENDING, COMPLETED, FAILED
+  resolvedAt        DateTime?
+  createdAt         DateTime       @default(now())
+  updatedAt         DateTime       @updatedAt
+
+  ledgerEntries     LedgerEntry[]
+
+  @@index([paymentId])
+}
+
+// ============================================================
+// DISPUTAS
+// ============================================================
+
+enum DisputeReason {
+  NO_ACCESS
+  WRONG_CREDENTIALS
+  ACCESS_LOST
+  SUSPENDED_ACCOUNT
+  PAYMENT_ISSUE
+  HOST_UNRESPONSIVE
+  GUEST_DID_NOT_PAY
+  OTHER
+}
+
+enum DisputeStatus {
+  OPEN
+  UNDER_REVIEW
+  RESOLVED_IN_FAVOR_GUEST
+  RESOLVED_IN_FAVOR_HOST
+  RESOLVED_PARTIAL
+  CLOSED_NO_ACTION
+  ESCALATED
+}
+
+model Dispute {
+  id               String         @id @default(cuid())
+  membershipId     String
+  membership       Membership     @relation(fields: [membershipId], references: [id], onDelete: Cascade)
+  paymentId        String?
+  payment          Payment?       @relation(fields: [paymentId], references: [id])
+  raisedById       String
+  raisedBy         User           @relation("DisputesBy", fields: [raisedById], references: [id])
+  againstId        String
+  against          User           @relation("DisputesAgainst", fields: [againstId], references: [id])
+  reason           DisputeReason
+  status           DisputeStatus  @default(OPEN)
+  description      String
+  evidenceUrls     Json?          // string[]
+  resolutionNotes  String?
+  refundAmountCOP  Decimal?       @db.Decimal(16, 2)
+  assignedTo       String?        // moderator user_id
+  slaDueAt         DateTime?
+  resolvedAt       DateTime?
+  createdAt        DateTime       @default(now())
+  updatedAt        DateTime       @updatedAt
+  closedAt         DateTime?
+
+  @@index([status, createdAt])
+  @@index([raisedById])
+  @@index([membershipId])
+}
+
+// ============================================================
+// CALIFICACIONES Y REPUTACIÓN
+// ============================================================
+
+model Rating {
+  id           String   @id @default(cuid())
+  fromUserId   String
+  fromUser     User     @relation("RatingsFrom", fields: [fromUserId], references: [id])
+  toUserId     String
+  toUser       User     @relation("RatingsTo", fields: [toUserId], references: [id])
+  listingId    String
+  listing      Listing  @relation("ListingRatings", fields: [listingId], references: [id])
+  paymentId    String?
+  stars        Int      // 1-5
+  comment      String?
+  badges       Json?    // ["paga_a_tiempo", "acceso_rapido", ...]
+  createdAt    DateTime @default(now())
+
+  @@unique([fromUserId, toUserId, listingId])
+  @@index([toUserId, createdAt])
+}
+
+// ============================================================
+// CHAT
+// ============================================================
+
+model Message {
+  id            String   @id @default(cuid())
+  membershipId  String
+  membership    Membership? @relation(fields: [membershipId], references: [id])
+  fromUserId    String
+  fromUser      User     @relation("MessagesFrom", fields: [fromUserId], references: [id])
+  content       String
+  contentType   String   @default("text") // text, image, file, system
+  isRead        Boolean  @default(false)
+  readAt        DateTime?
+  // Moderación
+  flagged       Boolean  @default(false)
+  flaggedReason String?
+  createdAt     DateTime @default(now())
+
+  @@index([membershipId, createdAt])
+  @@index([fromUserId, createdAt])
+}
